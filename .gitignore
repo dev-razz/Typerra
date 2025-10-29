@@ -1,0 +1,37 @@
+# Node / package managers
+node_modules/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# Build output
+/dist/
+/build/
+/out/
+
+# Vite cache
+.vite/
+node_modules/.vite/
+
+# TypeScript
+*.tsbuildinfo
+
+# Environment files
+.env
+.env.*
+
+# OS / Editor junk
+.DS_Store
+**/.DS_Store
+
+# Temporary files
+.tmp/
+tmp/
+.temp/*
+
+# VS Code - keep recommended files if present
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
