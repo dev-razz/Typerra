@@ -40,6 +40,29 @@ window.addEventListener('message', (evt) => {
   }
 });
 
+// Lightweight heartbeat: if inpage bridge is present, send a ping periodically so the page-side
+// script can detect extension activity. If the extension is disabled/removed or the content script
+// goes away, heartbeats stop and the inpage script self-disposes to free memory.
+try {
+  const HB_MARK = '__TYPERRA_HEARTBEAT__';
+  const w = window as any;
+  if (!w[HB_MARK]) {
+    w[HB_MARK] = true;
+    const HEARTBEAT_INTERVAL_MS = 15_000; // match inpage check cadence
+    const t = setInterval(() => {
+      try {
+        if (document.getElementById('typerra-inpage')) {
+          // Fire-and-forget ping (do not ensure/inject)
+          window.postMessage({ __gx: true, direction: 'cs->inpage', id: 0, method: 'ping', params: {} }, '*');
+        }
+      } catch {}
+    }, HEARTBEAT_INTERVAL_MS);
+    // Clean up on navigation
+    window.addEventListener('beforeunload', () => { try { clearInterval(t); } catch {} }, { once: true });
+    window.addEventListener('pagehide', () => { try { clearInterval(t); } catch {} }, { once: true });
+  }
+} catch {}
+
 async function callInpage<T = any>(method: string, params: any): Promise<T> {
   // Ensure the in-page bridge is present before posting
   try { await ensureInpage(); } catch {}
@@ -72,7 +95,25 @@ function isEditable(el: Element | null): el is HTMLElement {
 
 function getActiveEditable(): HTMLElement | null {
   const active = document.activeElement as HTMLElement | null;
-  return isEditable(active) ? active : null;
+  if (isEditable(active)) return active;
+  // Fallback: if selection is within a contentEditable, use the closest ancestor
+  try {
+    const sel = document.getSelection();
+    const anchor = sel?.anchorNode || null;
+    if (anchor) {
+      let n: Node | null = anchor;
+      while (n) {
+        if (n instanceof HTMLElement && n.isContentEditable) return n;
+        n = (n as Node).parentNode;
+      }
+    }
+  } catch {}
+  // Gmail compose: attempt to locate the message body editor explicitly
+  if (IS_GMAIL) {
+    const body = document.querySelector('div[aria-label="Message Body"][contenteditable="true"]') as HTMLElement | null;
+    if (body) return body;
+  }
+  return null;
 }
 
 // Small helpers and constants
@@ -84,6 +125,9 @@ const BUBBLE = 28;
 const BASE_FONT = 13;
 const SMALL_FONT = 10;
 const clamp = (v: number, min: number, max: number) => Math.max(min, Math.min(max, v));
+// Host feature flags
+const IS_GOOGLE_DOCS = typeof location !== 'undefined' && /(^|\.)docs\.google\.com$/.test(location.hostname);
+const IS_GMAIL = typeof location !== 'undefined' && /(^|\.)mail\.google\.com$/.test(location.hostname);
 // Performance guards
 const MAX_REALTIME_CHARS = 2000; // disable realtime proofread and overlay beyond this size
 const MIN_INTERVAL_MS = 700; // minimum time between consecutive proofread calls
@@ -334,10 +378,23 @@ function Popover({ target, onDisable }: { target: HTMLElement | null; onDisable:
 
   // Position the GX bubble near the active target and keep it clamped in viewport
   const updatePosition = () => {
-    if (!target) return;
-    const rect = target.getBoundingClientRect();
     const bubble = BUBBLE;
     const margin = MARGIN;
+    if (!target) {
+      // Fallback/pinned placement when no detectable editable (e.g., Google Docs)
+      const top = clamp(window.innerHeight - bubble - margin, margin, window.innerHeight - bubble - margin);
+      const left = clamp(window.innerWidth - bubble - margin, margin, window.innerWidth - bubble - margin);
+      setPosition({ top, left });
+      return;
+    }
+    const rect = target.getBoundingClientRect();
+    // Fall back to pinned placement if rect is degenerate (seen in Gmail)
+    if (!isFinite(rect.top) || !isFinite(rect.left) || rect.width < 4 || rect.height < 4) {
+      const top = clamp(window.innerHeight - bubble - margin, margin, window.innerHeight - bubble - margin);
+      const left = clamp(window.innerWidth - bubble - margin, margin, window.innerWidth - bubble - margin);
+      setPosition({ top, left });
+      return;
+    }
     let top = rect.bottom - bubble / 2;
     let left = rect.right - bubble / 2;
     top = clamp(top, margin, window.innerHeight - bubble - margin);
@@ -360,15 +417,40 @@ function Popover({ target, onDisable }: { target: HTMLElement | null; onDisable:
 
   // Keep panel beside the textarea and inside the viewport in a simple, reusable way
   useEffect(() => {
-    if (!open || !target) return;
-    updatePopupPlacement(true);
-    const onReflow = () => updatePopupPlacement(false);
-    window.addEventListener('resize', onReflow);
-    window.addEventListener('scroll', onReflow, true);
-    return () => {
-      window.removeEventListener('resize', onReflow);
-      window.removeEventListener('scroll', onReflow, true);
-    };
+    if (!open) return;
+    if (target) {
+      updatePopupPlacement(true);
+      const onReflow = () => updatePopupPlacement(false);
+      window.addEventListener('resize', onReflow);
+      window.addEventListener('scroll', onReflow, true);
+      return () => {
+        window.removeEventListener('resize', onReflow);
+        window.removeEventListener('scroll', onReflow, true);
+      };
+    } else {
+      // Default placement when no target (e.g., Docs): bottom-right with margins
+      const margin = MARGIN;
+      const w = Math.min(Math.max(PANEL_MIN_W, 300), Math.min(PANEL_MAX_W, window.innerWidth - margin * 2));
+      setPanelW(w);
+      const top = clamp(window.innerHeight - 260 - margin, margin, window.innerHeight - 260 - margin);
+      const left = clamp(window.innerWidth - w - margin, margin, window.innerWidth - w - margin);
+      setPanelPos({ top, left });
+      setPanelMaxH(Math.max(160, Math.round(window.innerHeight * PANEL_MAX_VH)));
+      const onReflow = () => {
+        const ww = Math.min(Math.max(PANEL_MIN_W, w), Math.min(PANEL_MAX_W, window.innerWidth - margin * 2));
+        setPanelW(ww);
+        const t = clamp(window.innerHeight - 260 - margin, margin, window.innerHeight - 260 - margin);
+        const l = clamp(window.innerWidth - ww - margin, margin, window.innerWidth - ww - margin);
+        setPanelPos({ top: t, left: l });
+        setPanelMaxH(Math.max(160, Math.round(window.innerHeight * PANEL_MAX_VH)));
+      };
+      window.addEventListener('resize', onReflow);
+      window.addEventListener('scroll', onReflow, true);
+      return () => {
+        window.removeEventListener('resize', onReflow);
+        window.removeEventListener('scroll', onReflow, true);
+      };
+    }
   }, [open, target]);
 
   // Close when clicking outside panel or button
@@ -674,7 +756,7 @@ function Popover({ target, onDisable }: { target: HTMLElement | null; onDisable:
               <div style={sectionStyle}>
                 {pLoading && <div style={mutedStyle}>Checking…</div>}
                 {!pLoading && pResult && <>
-                  <textarea style={textareaStyle} rows={6} value={pResult} onChange={(e)=>setPResult(e.target.value)} />
+                  <textarea style={textareaStyle} rows={4} value={pResult} onChange={(e)=>setPResult(e.target.value)} />
                   <button onClick={applyProofread} style={secondaryBtn}>Apply</button>
                 </>}
               </div>
@@ -697,14 +779,14 @@ function Popover({ target, onDisable }: { target: HTMLElement | null; onDisable:
                 </div>
                 <button disabled={rwLoading} onClick={runRewrite} style={primaryBtn}>Rewrite selection or field</button>
                 {rwResult && <>
-                  <textarea style={textareaStyle} rows={6} value={rwResult} onChange={(e)=>setRwResult(e.target.value)} />
+                  <textarea style={textareaStyle} rows={4} value={rwResult} onChange={(e)=>setRwResult(e.target.value)} />
                   <button onClick={applyRewrite} style={secondaryBtn}>Replace</button>
                 </>}
               </div>
             )}
             {tab === 'write' && (
               <div style={sectionStyle}>
-                <textarea placeholder="Describe what to write…" style={textareaStyle} rows={4} value={wPrompt} onChange={(e)=>setWPrompt(e.target.value)} />
+                <textarea placeholder="Describe what to write…" style={textareaStyle} rows={3} value={wPrompt} onChange={(e)=>setWPrompt(e.target.value)} />
                 <div style={rowStyle}>
                   <label style={labelStyle}> Tone: </label>
                   <select style={selectStyle} value={wTone} onChange={(e)=>setWTone(e.target.value as any)}>
@@ -803,11 +885,33 @@ function App() {
   const lastRangesRef = useRef<ProofreadRange[]>([]);
   const lastProofreadAtRef = useRef<number>(0);
   const [suggest, setSuggest] = useState<{ open: boolean; top: number; left: number; text: string; range: { start: number; end: number } | null }>({ open: false, top: 0, left: 0, text: '', range: null });
+  const CLIENT_IDLE_DISPOSE_MS = 30_000; // if UI is inactive and no target for 30s, dispose models in this page
 
   // Per-tab only: start enabled by default; disabling via × affects only this tab instance
   useEffect(() => {
     setEnabled(true);
   }, []);
+
+  // Proactive page-level idle disposal: if there's no active target, no overlay, and no UI open
+  // for a while, dispose models in this page context to minimize RAM footprint.
+  useEffect(() => {
+    const t = window.setInterval(() => {
+      try {
+        const now = Date.now();
+        const noTarget = !target;
+        const noUI = !panelOpenRef.current && !suggest.open;
+        const noOverlay = !overlayRef.current;
+        const longSinceProofread = now - (lastProofreadAtRef.current || 0) > CLIENT_IDLE_DISPOSE_MS;
+        if (noTarget && noUI && noOverlay && longSinceProofread) {
+          if (document.getElementById('typerra-inpage')) {
+            // Best-effort; do not inject inpage if not present
+            callInpage('dispose', {} as any).catch(()=>{});
+          }
+        }
+      } catch {}
+    }, 10_000);
+    return () => { try { window.clearInterval(t); } catch {} };
+  }, [target, suggest.open]);
 
   // Global realtime proofread toggle via storage (affects all tabs)
   useEffect(() => {
@@ -1141,7 +1245,7 @@ function App() {
     }
   }
 
-  if (!enabled || !target) return null;
+  if (!enabled) return null;
   return (
     <>
   <Popover target={target} onDisable={() => setEnabled(false)} />
@@ -1176,12 +1280,17 @@ function App() {
     root.render(<App />);
     mounted = true;
   }
-  const onFocusIn = (e: Event) => {
-    const t = e.target as HTMLElement | null;
-    if (t && isEditable(t)) {
-      try { mount(); } catch {}
-      document.removeEventListener('focusin', onFocusIn, true);
-    }
-  };
-  document.addEventListener('focusin', onFocusIn, true);
+  if (IS_GOOGLE_DOCS || IS_GMAIL) {
+    // On Google Docs and Gmail, mount immediately so the bubble is available even before focus
+    try { mount(); } catch {}
+  } else {
+    const onFocusIn = (e: Event) => {
+      const t = e.target as HTMLElement | null;
+      if (t && isEditable(t)) {
+        try { mount(); } catch {}
+        document.removeEventListener('focusin', onFocusIn, true);
+      }
+    };
+    document.addEventListener('focusin', onFocusIn, true);
+  }
 })();

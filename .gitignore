@@ -6,11 +6,6 @@ logs/
 *.log
 npm-debug.log*
 
-# Build output
-/dist/
-/build/
-/out/
-
 # Vite cache
 .vite/
 node_modules/.vite/

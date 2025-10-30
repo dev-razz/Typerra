@@ -37,6 +37,10 @@ async function ensureAvailability(Cls: any): Promise<'available' | 'downloadable
 let cachedWriter: any | null = null;
 let cachedRewriter: any | null = null;
 let cachedProofreader: any | null = null;
+// Creation locks to prevent duplicate instances under concurrent calls
+let writerCreating: Promise<any> | null = null;
+let rewriterCreating: Promise<any> | null = null;
+let proofreaderCreating: Promise<any> | null = null;
 
 function safeDispose(obj: any) {
   try {
@@ -55,6 +59,10 @@ function disposeModels() {
   cachedWriter = null;
   cachedRewriter = null;
   cachedProofreader = null;
+  // Also clear creation locks so future calls can recreate cleanly
+  writerCreating = null;
+  rewriterCreating = null;
+  proofreaderCreating = null;
 }
 
 function disposeNonProofreader() {
@@ -125,58 +133,76 @@ function buildProofreadPayload(base: string, apiResult: any): { corrected: strin
 
 async function getWriter(options: any = {}): Promise<any> {
   if (cachedWriter) return cachedWriter;
-  const avail = await ensureAvailability((window as any).Writer);
-  if (avail === 'unavailable') throw new Error('Writer API unavailable in this browser.');
-  cachedWriter = await (window as any).Writer.create({
-    ...options,
-    monitor(m: any) {
-      m.addEventListener('downloadprogress', (e: any) => {
-        // Optionally forward progress
-        // console.log('Writer download', e.loaded, e.total);
-      });
-    },
-    expectedInputLanguages: ['en'],
-    expectedContextLanguages: ['en'],
-    outputLanguage: 'en',
-  });
-  return cachedWriter;
+  if (writerCreating) return writerCreating;
+  writerCreating = (async () => {
+    const avail = await ensureAvailability((window as any).Writer);
+    if (avail === 'unavailable') throw new Error('Writer API unavailable in this browser.');
+    const inst = await (window as any).Writer.create({
+      ...options,
+      monitor(m: any) {
+        m.addEventListener('downloadprogress', (e: any) => {
+          // Optionally forward progress
+          // console.log('Writer download', e.loaded, e.total);
+        });
+      },
+      expectedInputLanguages: ['en'],
+      expectedContextLanguages: ['en'],
+      outputLanguage: 'en',
+    });
+    cachedWriter = inst;
+    writerCreating = null;
+    return inst;
+  })().catch((e) => { writerCreating = null; throw e; });
+  return writerCreating;
 }
 
 async function getRewriter(options: any = {}): Promise<any> {
   if (cachedRewriter) return cachedRewriter;
-  const avail = await ensureAvailability((window as any).Rewriter);
-  if (avail === 'unavailable') throw new Error('Rewriter API unavailable in this browser.');
-  cachedRewriter = await (window as any).Rewriter.create({
-    ...options,
-    monitor(m: any) {
-      m.addEventListener('downloadprogress', (e: any) => {
-        // console.log('Rewriter download', e.loaded, e.total);
-      });
-    },
-    expectedInputLanguages: ['en'],
-    expectedContextLanguages: ['en'],
-    outputLanguage: 'en',
-  });
-  return cachedRewriter;
+  if (rewriterCreating) return rewriterCreating;
+  rewriterCreating = (async () => {
+    const avail = await ensureAvailability((window as any).Rewriter);
+    if (avail === 'unavailable') throw new Error('Rewriter API unavailable in this browser.');
+    const inst = await (window as any).Rewriter.create({
+      ...options,
+      monitor(m: any) {
+        m.addEventListener('downloadprogress', (e: any) => {
+          // console.log('Rewriter download', e.loaded, e.total);
+        });
+      },
+      expectedInputLanguages: ['en'],
+      expectedContextLanguages: ['en'],
+      outputLanguage: 'en',
+    });
+    cachedRewriter = inst;
+    rewriterCreating = null;
+    return inst;
+  })().catch((e) => { rewriterCreating = null; throw e; });
+  return rewriterCreating;
 }
 
 async function getProofreader(options: any = {}): Promise<any> {
   if (cachedProofreader) return cachedProofreader;
-  const avail = await ensureAvailability((window as any).Proofreader);
-  if (avail === 'unavailable') throw new Error('Proofreader API unavailable in this browser.');
-  cachedProofreader = await (window as any).Proofreader.create({
-    ...options,
-    monitor(m: any) {
-      m.addEventListener('downloadprogress', (e: any) => {
-        try {
-          const { loaded, total } = e || {};
-          console.log('[Typerra][INPAGE] Proofreader download progress', loaded, '/', total);
-        } catch {}
-      });
-    },
-    expectedInputLanguages: ['en']
-  });
-  return cachedProofreader;
+  if (proofreaderCreating) return proofreaderCreating;
+  proofreaderCreating = (async () => {
+    const avail = await ensureAvailability((window as any).Proofreader);
+    if (avail === 'unavailable') throw new Error('Proofreader API unavailable in this browser.');
+    const inst = await (window as any).Proofreader.create({
+      ...options,
+      monitor(m: any) {
+        m.addEventListener('downloadprogress', (e: any) => {
+          try {
+            const { loaded, total } = e || {};
+            console.log('[Typerra][INPAGE] Proofreader download progress', loaded, '/', total);
+          } catch {}
+        });
+      },
+      expectedInputLanguages: ['en']
+    });
+    cachedProofreader = inst;
+    proofreaderCreating = null;
+    return inst;
+  })().catch((e) => { proofreaderCreating = null; throw e; });
+  return proofreaderCreating;
 }
 
 function mapWriterTone(t: string | undefined) {
@@ -200,13 +226,24 @@ function mapRewriterLength(l: string | undefined) {
   return undefined;
 }
 
+// Track last activity/heartbeat to enable idle GC
+let lastActivityAt = Date.now();
+let lastPingAt = Date.now();
+
 async function handle(method: string, params: any) {
   switch (method) {
+    case 'ping': {
+      // Only update ping timestamp; do not treat as model activity
+      lastPingAt = Date.now();
+      return { ok: true, t: lastPingAt };
+    }
     case 'warmup': {
+      lastActivityAt = Date.now();
       await warmupModels();
       return { ok: true };
     }
     case 'ensure': {
+      lastActivityAt = Date.now();
       const which = String(params?.model || '').toLowerCase();
       if (which === 'proofreader') { await getProofreader(); return { ok: true, model: 'proofreader' }; }
       if (which === 'writer') { await getWriter(); return { ok: true, model: 'writer' }; }
@@ -222,12 +259,14 @@ async function handle(method: string, params: any) {
       return { ok: true };
     }
     case 'write': {
+      lastActivityAt = Date.now();
       const { prompt, tone, length } = params || {};
       const writer = await getWriter({ tone: mapWriterTone(tone), length: mapWriterLength(length) });
       const res = await writer.write(String(prompt || ''));
       return String(res);
     }
     case 'rewrite': {
+      lastActivityAt = Date.now();
       const { text, tone, length, context } = params || {};
       const rewriter = await getRewriter({ tone: mapRewriterTone(tone), length: mapRewriterLength(length) });
       const instruction = String(
@@ -238,6 +277,7 @@ async function handle(method: string, params: any) {
       return String(res).trim();
     }
     case 'proofread': {
+      lastActivityAt = Date.now();
       const { text } = params || {};
       const proofreader = await getProofreader();
       const base = String(text || '');
@@ -298,3 +338,30 @@ async function warmupModels() {
 // The models will be created lazily on first use (proofread/rewrite/write).
 // You can still trigger warmup explicitly from the content script via callInpage('warmup').
 try { /* warmup deferred until explicitly requested */ } catch {}
+
+// Dispose aggressively when page goes away
+try {
+  window.addEventListener('beforeunload', () => { try { disposeModels(); } catch {} }, { once: true });
+  window.addEventListener('pagehide', () => { try { disposeModels(); } catch {} }, { once: true });
+} catch {}
+
+// Idle monitor: dispose when there is no model activity for a while, or if pings stop (extension disabled).
+const MODEL_IDLE_MS = 30_000; // 30s of no model activity -> dispose models
+const PING_MISS_MS = 30_000; // if no heartbeat for 30s, dispose models
+const HIDDEN_IDLE_MS = 20_000; // when tab is hidden, be more aggressive
+const CHECK_INTERVAL_MS = 15_000;
+try {
+  setInterval(() => {
+    const now = Date.now();
+    const sinceActivity = now - lastActivityAt;
+    const sincePing = now - lastPingAt;
+    const activityLimit = (document.visibilityState === 'hidden') ? HIDDEN_IDLE_MS : MODEL_IDLE_MS;
+    const shouldDispose = (sinceActivity > activityLimit) || (sincePing > PING_MISS_MS);
+    if (shouldDispose) {
+      try { disposeModels(); } catch {}
+      // Nudge timestamps to reduce repeated dispose calls while still allowing future recreation
+      lastActivityAt = now;
+      lastPingAt = now;
+    }
+  }, CHECK_INTERVAL_MS);
+} catch {}

@@ -55,6 +55,14 @@ npm run build
 - The UI is intentionally minimal. You can style it further or add highlight overlays for per‑correction visualization.
 - If availability is `downloadable`, the first call will trigger a model download; downloading can take time.
 
+### Memory management
+
+- Singletons per page: the in‑page script maintains at most one instance of each model (Writer, Rewriter, Proofreader). Concurrent creation is locked to prevent duplicate instances.
+- Lazy load: models are only created on first use; warmup is not automatic to keep idle RAM small.
+- Proactive disposal: when the panel closes we dispose Writer/Rewriter; when realtime proofreading is disabled, we dispose all models for that page.
+- Heartbeat/idle GC: the content script pings the in‑page script every ~15s; if pings stop for ~60s (e.g., extension disabled/uninstalled or tab becomes idle), the in‑page script unloads all models to avoid leaks. Models are also disposed on page unload/pagehide.
+- You can tweak timings in `src/inpage/index.ts` (IDLE_DISPOSE_MS) and `src/contentScript/main.tsx` (HEARTBEAT_INTERVAL_MS).
+
 ## Development
 
 - Watch build:
